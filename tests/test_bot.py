@@ -312,6 +312,27 @@ def test_send_long_never_cuts_html(cut):
     assert all(len(t) <= 4096 for t in sent) and "end" in sent[-1]
 
 
+class Recorder:
+    def __init__(self):
+        self.sent = []
+
+    async def reply_text(self, text, **kwargs):
+        check_html(text)
+        self.sent.append(text)
+
+
+def test_send_blocks_splits_long_multiline_block():
+    m = Recorder()
+    asyncio.run(bot.send_blocks(m, ["title", "<i>" + ("y" * 3000 + "\n") * 3 + "</i>"]))
+    assert all(len(t) <= 4096 for t in m.sent) and len(m.sent) >= 2
+
+
+def test_send_blocks_never_sends_a_blank_message():
+    m = Recorder()
+    asyncio.run(bot.send_blocks(m, ["a" * 3999, "", "b" * 5000]))
+    assert all(t.strip() for t in m.sent) and len(m.sent) == 2
+
+
 def test_concurrent_updates_enabled(tg):
     assert tg.app.concurrent_updates > 1
 
@@ -358,6 +379,37 @@ def test_cancel_clears_pending_rebuttal(tg):
     tg.text("/cancel")
     tg.text("MSFT")
     assert "Looking at <b>MSFT</b>" in tg.last()
+
+
+def test_checkin_command(tg, world):
+    tg.text("/checkin")
+    assert "No past analyses" in tg.last()
+    full_run(tg)
+    world.news = [{"id": 99, "headline": "Fresh AAPL story", "summary": "s", "source": "Reuters",
+                   "url": "https://news.example/fresh", "datetime": world.news[0]["datetime"] + 60}] + world.news
+    db.news_fetches.delete_many({})
+    tg.text("/checkin aapl")
+    all_text = tg.texts()
+    assert "Check-in: AAPL" in all_text and "🐻 weaker" in all_text and "Where do you stand now on AAPL?" in all_text
+    # The buttons sit on their own short message, so answering doesn't overwrite the check-in
+    kind, text, markup = tg.out[-1]
+    assert markup and text.startswith("Where do you stand now") and "Check-in" not in text
+    tg.press(tg.buttons("dec:")[-1])
+    assert db.theses.find_one({})["decision"] == "dropping"
+
+
+def test_checkin_unknown_stock(tg):
+    tg.text("/checkin zzzz")
+    assert "No company found" in tg.last()
+
+
+def test_checkin_mid_flow_keeps_analysis(tg):
+    full_run(tg)
+    tg.text("MSFT")
+    tg.text("/checkin")
+    assert "Check-in: AAPL" in tg.texts()
+    tg.press("intent:curious")
+    assert "Why are you interested" in tg.last()
 
 
 def test_decision_saved(tg):

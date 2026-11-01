@@ -13,6 +13,8 @@ Collections
                   user's words), urls, fetchedAt }
 - financials  : fact table per ticker { ticker, facts[{id, label, value, unit, period}], fetchedAt }
 - companies   : peers per ticker, for "similar stocks you looked at" { ticker, peers, fetchedAt }
+- checkins    : a past thesis re-checked against news since { userId, thesisId, sessionId, ticker,
+                  sources, assumptions[{id, text, change, note, sources}], summary, priceThen, priceNow }
 - sessions    : one analysis run { userId, ticker, reason, stockRisk, generalRisk,
                   sources, facts, assumptions, counts, summary, critique, remembered, createdAt }
 - messages    : every LLM call { sessionId, userId, role, prompt, content, createdAt }
@@ -42,6 +44,7 @@ theses = db["theses"]
 searches = db["searches"]
 financials = db["financials"]
 companies = db["companies"]
+checkins = db["checkins"]
 
 
 def now():
@@ -72,6 +75,8 @@ def init_indexes():
     searches.create_index([("ticker", ASCENDING), ("queryKey", ASCENDING)], unique=True)
     financials.create_index("ticker", unique=True)
     companies.create_index("ticker", unique=True)
+    checkins.create_index([("userId", ASCENDING), ("createdAt", DESCENDING)])
+    checkins.create_index("thesisId")
 
 
 def ping():

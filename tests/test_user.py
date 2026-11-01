@@ -61,7 +61,7 @@ def test_save_thesis_validates_and_stores_assumptions():
     t = thesis(assumptions=[{"id": "A1", "text": "x", "status": "supported", "note": "n", "query": "q",
                              "sources": ["S1"]}], peers=["MSFT"])
     stored = db.theses.find_one({"_id": t["_id"]})
-    assert stored["assumptions"] == [{"id": "A1", "text": "x", "status": "supported", "note": "n"}]
+    assert stored["assumptions"] == [{"id": "A1", "text": "x", "query": "q", "status": "supported", "note": "n"}]
     assert stored["peers"] == ["MSFT"] and stored["remembered"] is True
     with pytest.raises(ValueError):
         user.save_thesis("u1", ObjectId(), "x", intent="gamble")
@@ -185,6 +185,16 @@ def test_forget_user_keeps_shared_news_and_other_users():
     assert counts["theses"] == 1 and counts["users"] == 1 and counts["objections"] == 1
     assert db.news.count_documents({}) == 1
     assert len(user.past_theses("u2")) == 1
+
+
+def test_latest_theses_one_per_stock():
+    thesis(ticker="AAPL", days_ago=5)
+    new = thesis(ticker="AAPL", days_ago=1)
+    thesis(ticker="MSFT", days_ago=2)
+    thesis(ticker="TSLA", remembered=False)
+    latest = user.latest_theses("u1")
+    assert [t["ticker"] for t in latest] == ["AAPL", "MSFT"] and latest[0]["_id"] == new["_id"]
+    assert user.latest_theses("u1", "AAPL")[0]["_id"] == new["_id"]
 
 
 def test_get_memory():

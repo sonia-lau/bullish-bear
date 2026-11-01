@@ -6,7 +6,7 @@ Flow: send a stock → snapshot of its financials → curious or buy/sell signal
       → sourced report → critic checks each assumption → devil's advocate objections
         (Accept / Rebut / Dismiss; a rebuttal is searched on the web) → where do you stand now?
 
-Commands: /analyse, /memory, /blindspots, /risk, /forget, /help, /cancel
+Commands: /analyse, /checkin, /memory, /blindspots, /risk, /forget, /help, /cancel
 Run:      .venv/bin/python bot.py
 '''
 
@@ -43,10 +43,14 @@ NEWS_COUNT =  10
 MAX_MESSAGE = 4000  # Telegram's limit is 4096
 DISCLAIMER = "<i>🐻 Not financial advice. The bot argues; you decide.</i>"
 HEADLINE_CHARS = 300
+KEY_POINTS_SHOWN = 3   # the rest of the report folds away (tap to expand)
+ISSUES_SHOWN = 2
 
 SENTIMENT_EMOJI = {"bullish": "🐂", "bearish": "🐻", "neutral": "➖", "irrelevant": "·"}
 RESPONSE_LABEL = {"accept": "✅ Accepted", "rebut": "💬 Rebutted", "dismiss": "🙈 Dismissed"}
 DECISION_LABEL = {"still_keen": "🐂 Still keen", "less_sure": "🤔 Less sure", "dropping": "🐻 Dropping it"}
+CHANGE_LABEL = {"stronger": "🐂 stronger", "weaker": "🐻 weaker", "unchanged": "➖ unchanged",
+                "no_news": "❔ no new news"}
 STATUS_LABEL = {"supported": "✅ supported", "contradicted": "❌ contradicted", "mixed": "⚖️ mixed",
                 "no_evidence": "❔ no evidence found"}
 NUMBER_LABEL = {"verified": " <i>(numbers checked ✓)</i>", "mismatch": " ⚠️ <i>number doesn't match the cited fact</i>"}
@@ -86,18 +90,59 @@ def snapshot_text(ticker, facts):
                                                      for f in shown)
 
 
+def fit(line, limit=MAX_MESSAGE):
+    '''A line that fits in one message. Cutting HTML mid-tag or mid-entity makes Telegram reject the
+    message, so an over-long line falls back to plain text.'''
+    if len(line) <= limit:
+        return line
+    return re.sub(r"&[#\w]*$", "", re.sub(r"<[^>]*>", "", line)[:limit])
+
+
+def fold(title, lines):
+    '''A collapsed section: the title stays visible, the lines expand on tap. Returned as blocks that
+    each fit in a message, so a long section becomes several quotes rather than broken HTML.'''
+    if not lines:
+        return []
+    room = MAX_MESSAGE - len(title) - 60
+    quotes, body = [], []
+    for line in lines:
+        line = fit(line, room)
+        if body and len("\n".join(body)) + len(line) + 1 > room:
+            quotes.append(body)
+            body = []
+        body.append(line)
+    quotes.append(body)
+    blocks = ["<blockquote expandable>" + "\n".join(q) + "</blockquote>" for q in quotes]
+    blocks[0] = title + "\n" + blocks[0]
+    return blocks
+
+
+async def send_blocks(message, blocks, **kwargs):
+    '''Send blocks (lines or folded sections) packed into as few messages as fit, splitting only between
+    blocks so no tag is cut. kwargs (e.g. buttons) go on the last message.'''
+    lines = []
+    for block in blocks:
+        # fold() output already fits; an over-long block falls back to plain text, split into lines that fit
+        if "<blockquote" in block or len(block) <= MAX_MESSAGE:
+            lines.append(block)
+        else:
+            plain = re.sub(r"<[^>]*>", "", block)
+            lines += [fit(line) for line in plain.split("\n")]
+    chunk = ""
+    for line in lines:
+        if chunk and len(chunk) + len(line) + 1 > MAX_MESSAGE:
+            if chunk.strip():   # Telegram rejects a message that is only blank lines
+                await message.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            chunk = ""
+        if chunk or line.strip():
+            chunk += line + "\n"
+    return await message.reply_text(chunk if chunk.strip() else "…", parse_mode=ParseMode.HTML,
+                                    disable_web_page_preview=True, **kwargs)
+
+
 async def send_long(message, text, **kwargs):
     '''Split on line breaks so no message goes over Telegram's limit.'''
-    chunk = ""
-    for line in text.split("\n"):
-        if len(chunk) + len(line) + 1 > MAX_MESSAGE and chunk:
-            await message.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-            chunk = ""
-        if len(line) > MAX_MESSAGE:
-            # Cutting HTML mid-tag or mid-entity makes Telegram reject the message, so fall back to plain text
-            line = re.sub(r"&[#\w]*$", "", re.sub(r"<[^>]*>", "", line)[:MAX_MESSAGE])
-        chunk += line + "\n"
-    return await message.reply_text(chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True, **kwargs)
+    return await send_blocks(message, text.split("\n"), **kwargs)
 
 
 # ---------- Start / help ----------
@@ -105,6 +150,7 @@ async def send_long(message, text, **kwargs):
 HELP = ("Send me a stock (e.g. <code>AAPL</code> or <code>apple</code>) and I'll gather the latest news, "
         "summarise it with sources, then argue against your reason for liking it.\n\n"
         "/analyse – start a new analysis\n"
+        "/checkin – revisit your past theses against the news since (or /checkin AAPL)\n"
         "/memory – what I remember about you (turn memory on/off, delete single entries)\n"
         "/blindspots – kinds of points you tend to dismiss\n"
         "/risk – set your general risk appetite\n"
@@ -331,56 +377,65 @@ async def run_and_report(message, status, user_id, request):
                                                     for key, label in DECISION_LABEL.items()]]))
 
 
+def source_line(s):
+    partial = {"teaser": " (preview)", "summary": " (summary only)"}.get(s.get("textSource"), "")
+    found = "🔎 " if s.get("origin") == "search" else ""
+    return (f'{s["id"]} {found}{SENTIMENT_EMOJI.get(s.get("sentiment"), "")} {esc(s.get("date"))} · '
+            f'{esc(s.get("source"))} · <a href="{esc(s["url"])}">{esc(str(s["headline"])[:HEADLINE_CHARS])}</a>{partial}')
+
+
 async def send_report(message, out):
+    '''The gist stays visible; facts, sources and extra key points fold away.'''
     sources, summary, counts = out["sources"], out["summary"], out["counts"]
     mood = " ".join(f"{SENTIMENT_EMOJI[k]} {k} {v}" for k, v in counts.items() if v)
     full = sum(s.get("textSource") == "article" for s in sources)
-    lines = [f"📰 <b>{esc(out['ticker'])}: what the news says</b>",
-             f"Overall: <b>{esc(summary.get('overall_sentiment', 'mixed'))}</b> · {mood}",
-             f"<i>{full} of {len(sources)} sources read in full</i>", "",
-             esc(summary.get("summary", ""))]
-    if summary.get("key_points"):
-        lines += ["", "<b>Key points</b>"]
-        for kp in summary["key_points"]:
-            flag = " ⚠️ <i>unverified</i>" if kp.get("unverified") else NUMBER_LABEL.get(kp.get("numberCheck"), "")
-            lines.append(f"• {esc(kp.get('point'))} {cite(kp.get('sources', []), sources)}{flag}")
-    if out.get("facts"):
-        lines += ["", "<b>Financial facts</b> (Finnhub)"]
-        lines += [f'{esc(f["id"])} {esc(f["label"])} ({esc(f["period"])}): {esc(financials.format_value(f))}'
-                  for f in out["facts"]]
-    lines += ["", "<b>Sources</b> (🔎 = found by searching your assumptions)"]
-    for s in sources:
-        partial = {"teaser": " (preview)", "summary": " (summary only)"}.get(s.get("textSource"), "")
-        found = "🔎 " if s.get("origin") == "search" else ""
-        lines.append(f'{s["id"]} {found}{SENTIMENT_EMOJI.get(s["sentiment"], "")} {esc(s.get("date"))} · '
-                     f'{esc(s["source"])} · <a href="{esc(s["url"])}">{esc(str(s["headline"])[:HEADLINE_CHARS])}</a>{partial}')
+    blocks = [f"📰 <b>{esc(out['ticker'])}: what the news says</b>",
+              f"Overall: <b>{esc(summary.get('overall_sentiment', 'mixed'))}</b> · {mood}",
+              f"<i>{full} of {len(sources)} sources read in full</i>", "",
+              esc(summary.get("summary", ""))]
+    points = []
+    for kp in summary.get("key_points") or []:
+        flag = " ⚠️ <i>unverified</i>" if kp.get("unverified") else NUMBER_LABEL.get(kp.get("numberCheck"), "")
+        points.append(f"• {esc(kp.get('point'))} {cite(kp.get('sources', []), sources)}{flag}")
+    if points:
+        blocks += ["", "<b>Key points</b>", *points[:KEY_POINTS_SHOWN]]
+        blocks += fold(f"<i>+{len(points) - KEY_POINTS_SHOWN} more</i>", points[KEY_POINTS_SHOWN:])
+    blocks.append("")
+    blocks += fold("📊 <b>Financial facts</b> (Finnhub)",
+                   [f'{esc(f["id"])} {esc(f["label"])} ({esc(f["period"])}): {esc(financials.format_value(f))}'
+                    for f in out.get("facts") or []])
+    searched = sum(s.get("origin") == "search" for s in sources)
+    blocks += fold(f"📚 <b>{len(sources)} sources</b>" + (f" ({searched} 🔎 found for your claims)" if searched else ""),
+                   [source_line(s) for s in sources])
     if out.get("remembered") is False:
-        lines += ["", "<i>Memory is off: this analysis won't be used in future runs.</i>"]
-    lines += ["", DISCLAIMER]
-    await send_long(message, "\n".join(lines))
+        blocks += ["", "<i>Memory is off: this analysis won't be used in future runs.</i>"]
+    blocks += ["", DISCLAIMER]
+    await send_blocks(message, blocks)
 
 
 async def send_critique(message, out):
+    '''Assumption verdicts and the critic's verdict stay visible; extra issues fold away.'''
     critique = out["critique"]
-    lines = []
+    blocks = []
     if out.get("assumptions"):
-        lines.append("🧪 <b>Your assumptions vs the evidence</b>")
+        blocks.append("🧪 <b>Your assumptions vs the evidence</b>")
         for a in out["assumptions"]:
-            lines.append(f"{a['id']}. {esc(a['text'])}: <b>{STATUS_LABEL.get(a.get('status'), '❔')}</b>")
+            blocks.append(f"{a['id']}. {esc(a['text'])}: <b>{STATUS_LABEL.get(a.get('status'), '❔')}</b>")
             if a.get("note"):
-                lines.append(f"   <i>{esc(a['note'])}</i> {cite(a.get('sources', []), out['sources'])}"
-                             + NUMBER_LABEL.get(a.get("numberCheck"), ""))
-        lines.append("")
-    lines.append("🔍 <b>Critic: holes in the reasoning</b>")
-    for issue in critique.get("issues", []):
-        who = "your reason" if issue.get("target") == "user" else "the summary"
-        lines.append(f"• <i>{who}:</i> {esc(issue.get('issue'))} {cite(issue.get('sources', []), out['sources'])}"
-                     + NUMBER_LABEL.get(issue.get("numberCheck"), ""))
-    if not critique.get("issues"):
-        lines.append("No problems found.")
+                blocks.append(f"   <i>{esc(a['note'])}</i> {cite(a.get('sources', []), out['sources'])}"
+                              + NUMBER_LABEL.get(a.get("numberCheck"), ""))
+        blocks.append("")
+    blocks.append("🔍 <b>Critic: holes in the reasoning</b>")
     if critique.get("verdict"):
-        lines += ["", f"<b>Verdict:</b> {esc(critique['verdict'])}"]
-    await send_long(message, "\n".join(lines))
+        blocks.append(f"<b>Verdict:</b> {esc(critique['verdict'])}")
+    issues = []
+    for issue in critique.get("issues") or []:
+        who = "your reason" if issue.get("target") == "user" else "the summary"
+        issues.append(f"• <i>{who}:</i> {esc(issue.get('issue'))} {cite(issue.get('sources', []), out['sources'])}"
+                      + NUMBER_LABEL.get(issue.get("numberCheck"), ""))
+    blocks += issues[:ISSUES_SHOWN] or ["No problems found."]
+    blocks += fold(f"<i>+{len(issues) - ISSUES_SHOWN} more</i>", issues[ISSUES_SHOWN:])
+    await send_blocks(message, blocks)
 
 
 def objection_text(o, sources, header=True):
@@ -485,6 +540,61 @@ async def expired_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     '''Buttons from a question that's no longer active (e.g. an old intent or risk question).'''
     await update.callback_query.answer("This question has expired. Send a stock to start again.",
                                        show_alert=True)
+
+
+# ---------- Check-in on past theses ----------
+
+async def checkin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    stock = " ".join(context.args) if context.args else None
+    status = await update.message.reply_text("🐻 Checking the news since your past theses…")
+    context.application.create_task(run_checkin(update.message, status, uid(update), stock))
+
+
+async def run_checkin(message, status, user_id, stock):
+    try:
+        checkins = await asyncio.to_thread(agent.thesis_checkin, user_id, stock)
+    except ValueError as e:
+        await status.edit_text(f"⚠️ {esc(e)}", parse_mode=ParseMode.HTML)
+        return
+    except Exception as e:
+        log.exception("Check-in failed")
+        await status.edit_text(f"⚠️ Something went wrong during the check-in: {esc(type(e).__name__)}.",
+                               parse_mode=ParseMode.HTML)
+        return
+    await status.edit_text(f"🐻 Checked {len(checkins)} past {'thesis' if len(checkins) == 1 else 'theses'}.")
+    for c in checkins:
+        try:
+            await send_checkin(message, c)
+        except Exception:
+            log.exception("Sending check-in failed")
+
+
+def price_line(c):
+    then, now = c.get("priceThen"), c.get("priceNow")
+    if not then or not now:
+        return None
+    return f"Price: ${then:,.2f} → <b>${now:,.2f}</b> ({(now / then - 1) * 100:+.1f}%)"
+
+
+async def send_checkin(message, c):
+    decided = f", you decided: {DECISION_LABEL[c['decision']]}" if c.get("decision") in DECISION_LABEL else ""
+    blocks = [f"🐻 <b>Check-in: {esc(c['ticker'])}</b>",
+              f"<i>On {esc(c['since'])} you said: \"{esc(c.get('reason') or 'no reason given')}\"{decided}</i>"]
+    if price_line(c):
+        blocks.append(price_line(c))
+    blocks.append("")
+    for a in c["assumptions"]:
+        blocks.append(f"{a['id']}. {esc(a['text'])}: <b>{CHANGE_LABEL.get(a.get('change'), '❔')}</b>")
+        if a.get("note"):
+            blocks.append(f"   <i>{esc(a['note'])}</i> {cite(a.get('sources', []), c['sources'])}"
+                          + NUMBER_LABEL.get(a.get("numberCheck"), ""))
+    blocks += ["", esc(c["summary"]), ""]
+    blocks += fold(f"📚 <b>{len(c['sources'])} new sources</b>", [source_line(s) for s in c["sources"]])
+    await send_blocks(message, blocks)
+    # Buttons on their own message, so answering them doesn't overwrite the check-in
+    await message.reply_text(f"Where do you stand now on {esc(c['ticker'])}?", parse_mode=ParseMode.HTML,
+                             reply_markup=buttons([[(label, f"dec:{c['sessionId']}:{key}")
+                                                    for key, label in DECISION_LABEL.items()]]))
 
 
 # ---------- Memory and blind spots ----------
@@ -633,6 +743,7 @@ def build_app(token):
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("risk", risk_cmd))
+    app.add_handler(CommandHandler("checkin", checkin_cmd))
     app.add_handler(CommandHandler("memory", memory_cmd))
     app.add_handler(CommandHandler("blindspots", blindspots_cmd))
     app.add_handler(CommandHandler("forget", forget_cmd))

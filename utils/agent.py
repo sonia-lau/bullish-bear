@@ -7,6 +7,7 @@ Agents
 - critic              : checks each of the user's assumptions, pokes holes in the summary
 - devils_advocate     : argues against buying, user's blind-spot categories first
 - rebuttal_reply      : devil's advocate answers when the user argues back (searches their claim)
+- thesis_checkin      : revisits a past thesis: news since then vs each assumption (/checkin)
 - run_analysis        : runs all of the above for one user and saves to MongoDB
 '''
 
@@ -720,6 +721,126 @@ Reply with JSON only:
     user.record_response(user_id, objection_id, "rebut", rebuttal)
     user.add_exchange(user_id, objection_id, rebuttal, result["reply"])
     return result
+
+
+# ---------- Check-in (revisit a past thesis) ----------
+
+CHANGES = ["stronger", "weaker", "unchanged", "no_news"]
+CHANGE_SYNONYMS = {"strengthened": "stronger", "supported": "stronger", "weakened": "weaker",
+                   "contradicted": "weaker", "same": "unchanged", "nonews": "no_news", "none": "no_news"}
+CHECKIN_NEWS = 3
+
+CHECKIN_SYSTEM = ("You are the devil's advocate checking in on an investor's earlier thesis. Using only the "
+                  "news published since then, say for each of their assumptions whether it now looks "
+                  "stronger, weaker or unchanged, or no_news if nothing new covers it. Be honest when "
+                  "the news helps them. Cite source ids. Reply with JSON only.")
+
+
+def share_price(facts):
+    return next((f["value"] for f in facts or [] if f["label"] == "Share price"), None)
+
+
+def checkin_assumptions(thesis):
+    '''The thesis's assumptions with a search query each (older theses stored none; the reason stands in).'''
+    ticker = thesis.get("ticker") or thesis["stock"]
+    items = [{"text": a.get("text"), "query": a.get("query"), "status": a.get("status")}
+             for a in thesis.get("assumptions") or []]
+    assumptions = make_assumptions(ticker, items or [thesis.get("reason") or f"{ticker} outlook"])
+    for a, item in zip(assumptions, items):
+        a["statusThen"] = item.get("status")
+    return assumptions
+
+
+def checkin_one(user_id, thesis):
+    ticker = thesis.get("ticker") or thesis["stock"]
+    session = db.sessions.find_one({"_id": thesis["sessionId"]}) or {}
+    since = thesis["createdAt"].date().isoformat()
+    assumptions = checkin_assumptions(thesis)
+    # Only news the user hasn't seen: not in the analysis, not in an earlier check-in on this thesis
+    earlier = list(db.checkins.find({"thesisId": thesis["_id"], "userId": user_id}).sort("createdAt", 1))
+    seen = (session.get("sources") or []) + [s for c in earlier for s in c.get("sources") or []]
+    news_from = earlier[-1]["createdAt"].date().isoformat() if earlier else since
+
+    # Finnhub since the last look, plus a web search per assumption
+    _, news = gather_top_n_news(ticker, CHECKIN_NEWS, start=news_from, ticker=ticker)
+    seen_urls = {s["url"] for s in seen}
+    articles = [a for a in news if a["url"] not in seen_urls]
+    found = gather_search_results(ticker, [a["query"] for a in assumptions], seen + articles)
+    articles += [a for a in found if not a.get("date") or a["date"] == "undated" or a["date"] >= news_from]
+    for i, a in enumerate(articles):
+        a["id"] = f"S{i + 1}"
+    results, _ = label_sentiments(ticker, articles, user_id=user_id)
+
+    facts = financials.get_facts(ticker)
+    price_then, price_now = share_price(session.get("facts")), share_price(facts)
+    if not visible(results):
+        checked = [{**a, "change": "no_news", "note": "", "sources": [], "unverified": False} for a in assumptions]
+        summary = f"No new news on {ticker} since {news_from}."
+    else:
+        prompt = f'''Stock: {ticker}
+On {since} the user said: "{thesis.get("reason") or "no reason given"}"
+Their decision then: {(thesis.get("decision") or "none").replace("_", " ")}
+Their assumptions and how the evidence stood then:
+{chr(10).join(f'{a["id"]}: {a["text"]} (then: {(a.get("statusThen") or "unchecked").replace("_", " ")})' for a in assumptions)}
+
+Financial facts now:
+{format_facts(facts)}
+
+News since {news_from}:
+{format_sources(results)}
+
+Reply with JSON only:
+{{"assumptions": [{{"id": "A1", "change": "stronger|weaker|unchanged|no_news", "note": "one sentence", "sources": ["S1"]}}],
+  "summary": "two sentences: what changed and whether the thesis still holds"}}'''
+        result = call_agent_json(prompt, CHECKIN_SYSTEM, user_id=user_id, role="checkin")
+        by_id = {}
+        for r in as_list(result.get("assumptions")):
+            ids = re.findall(r"A\s*(\d+)", str(r.get("id") or ""), re.I) if isinstance(r, dict) else []
+            if ids:
+                by_id.setdefault(f"A{ids[0]}", r)
+        checked = []
+        for a in assumptions:
+            r = by_id.get(a["id"], {})
+            change = re.sub(r"[^a-z_]", "", str(r.get("change") or "").lower())
+            change = CHANGE_SYNONYMS.get(change.replace("_", ""), change)
+            checked.append({**a, "change": change if change in CHANGES else "no_news",
+                            "note": str(r.get("note") or "").strip(), "sources": r.get("sources")})
+        checked = check_citations(checked, results, facts=facts)
+        summary = str(result.get("summary") or "").strip()
+
+    checkin = {"userId": user_id, "thesisId": thesis["_id"], "sessionId": thesis["sessionId"], "ticker": ticker,
+               "since": since, "reason": thesis.get("reason"), "decision": thesis.get("decision"),
+               "sources": [session_source(a) for a in results], "assumptions": checked, "summary": summary,
+               "priceThen": price_then, "priceNow": price_now, "createdAt": db.now()}
+    # The user may have forgotten this thesis or turned memory off while we were working
+    if not user.memory_on(user_id) or not db.theses.find_one({"_id": thesis["_id"], "userId": user_id}):
+        return None
+    checkin["_id"] = db.checkins.insert_one(checkin).inserted_id
+    return checkin
+
+
+def thesis_checkin(user_id, stock=None, limit=3):
+    '''Revisit the user's latest thesis on each of their recent stocks (or just `stock`).'''
+    if not user.memory_on(user_id):
+        raise ValueError("Memory is off, so there are no past theses to check in on. Turn it on in /memory.")
+    ticker = find_company(stock) if stock else None
+    theses = user.latest_theses(user_id, ticker, limit)
+    if not theses:
+        raise ValueError(f"No past analysis of {ticker} to check in on." if ticker
+                         else "No past analyses to check in on yet. Send me a stock first.")
+    checkins, error = [], None
+    for t in theses:   # one stock failing (e.g. a Finnhub error) doesn't lose the others
+        try:
+            c = checkin_one(user_id, t)
+        except Exception as e:
+            log.exception("Check-in on %s failed", t.get("ticker"))
+            error = e
+            continue
+        if c:
+            checkins.append(c)
+    if error and not checkins:
+        raise error
+    return checkins
 
 
 # ---------- Full run ----------

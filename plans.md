@@ -37,6 +37,9 @@ User responds (Telegram buttons)
 User memory (utils/user.py, only if memory is on) → past theses on this stock and similar stocks (peers),
    how their assumptions held up, dismiss counts → next run's prompts and objection ranking
    ▼
+/checkin (later) → news since the thesis (only articles the user hasn't seen) + a web search per assumption
+   → each assumption stronger / weaker / unchanged / no news, price then vs now → "Where do you stand now?"
+   ▼
 MongoDB (bullish_bear)
 ```
 
@@ -78,18 +81,20 @@ users        { userId: "tg:<id>", name, generalRisk, mutedCategories, memoryOn, 
 news         { ticker, url, headline, summary, source, date, datetime,
                fullText, textSource: "article"|"teaser"|"summary",
                sentiment, reason, sentimentModel, fetchedAt,
-               origin: "search", queries }                          ← shared cache (origin only on web results)
+               origin: "search" }                                   ← shared cache (origin only on web results)
 news_fetches { ticker, start, end, fetchedAt }                       ← 6-hour cache window
-searches     { ticker, query, urls, fetchedAt }                      ← 6-hour web search cache
+searches     { ticker, queryKey (sha256), urls, fetchedAt }          ← 6-hour web search cache (no user words)
 financials   { ticker, facts[{id, label, value, unit, period}], fetchedAt }   ← 12-hour cache
 companies    { ticker, peers, fetchedAt }                            ← 7-day peers cache
 sessions     { userId, stock, ticker, reason, intent, stockRisk, generalRisk, status, remembered,
                sources[{id, url, headline, source, date, sentiment, textSource, origin, query, text}],
                facts, assumptions, counts, textSources, summary, critique, objectionIds, error }
 theses       { userId, sessionId, stock, ticker, reason, intent, stockRisk,
-               assumptions[{id, text, status, note}], peers, remembered, decision }
+               assumptions[{id, text, query, status, note}], peers, remembered, decision }
 objections   { sessionId, userId, ticker, category, claim, sources, unverified, numberCheck, whyFirst,
                response: "accept"|"rebut"|"dismiss", rebuttal, exchanges[{rebuttal, reply}], remembered }
+checkins     { userId, thesisId, sessionId, ticker, since, reason, sources, summary, priceThen, priceNow,
+               assumptions[{id, text, statusThen, change, note, sources}], decision, createdAt }
 messages     { sessionId, userId, role, system, prompt, content }   ← every LLM call
 ```
 
@@ -105,7 +110,7 @@ Blind spots are counted from `objections` (dismissed / responded per category), 
 - [x] `python-telegram-bot` 21.11.1, `trafilatura`, `pymongo`, `finnhub-python` in `.venv`
 - [x] `requirements.txt`
 - [x] Tavily: back, but only for targeted searches on the user's claims (`topic="news"`); Finnhub stays the main feed
-- [x] `pytest` suite: 180 tests, ~2.5 s, no network; mutation-checked (re-introducing 19 known bugs each makes it fail)
+- [x] `pytest` suite: 201 tests, ~2.5 s, no network; mutation-checked (re-introducing 19 known bugs each makes it fail)
 - [x] Independent review of web search / facts / assumptions / peers / memory control: 21 confirmed issues fixed, each with a test
       (number checker misreading "a 24.3%", ranges, "−"; loose tolerance on small ratios; Finnhub outage killing a run;
       memory-off runs not deletable; user's rebuttal text kept in the shared cache; one user blocking others; broken HTML on long lines)
@@ -149,6 +154,10 @@ Blind spots are counted from `objections` (dismissed / responded per category), 
 - [x] Assumptions vs evidence section before the critic's issues; rebuttal reply lists what the search found
 - [x] Report: overall sentiment, counts, how many read in full, key points with linked `[S#]`, sources list
 - [x] Critic message
+- [x] Collapsible report: summary, overall and top 3 key points visible; other points, facts and sources in
+      tap-to-expand blocks (`<blockquote expandable>`); critic shows the verdict and top 2 issues the same way
+- [x] `/checkin [stock]`: revisits the latest thesis per stock (up to 3) against news since then, only unseen
+      articles; per-assumption change, price then → now, ends with "Where do you stand now?" (needs memory on)
 - [x] Each objection with Fair point / Rebut / Dismiss buttons (`callback_data` ≤ 64 bytes)
 - [x] Rebut → user types counter-argument → devil concedes or holds → can rebut again
 - [x] "Where do you stand?" buttons → decision saved
@@ -175,7 +184,7 @@ Needs your machine (live Finnhub, Tavily, OpenRouter).
 | 7 | Cost / speed | logs | seconds, LLM calls, cache speed-up | — |
 | 8 | Sentiment | 30 articles hand-labelled | accuracy, Cohen's κ; full text vs summary | — |
 | 9 | Citation support | 30 key points hand-checked (+ LLM judge agreement) | % supported | verifiable claims |
-| 10 | User study (plus) | 3–5 people, task script | SUS, decision change, blind-spot accuracy (Likert), time | all |
+| 10 | User study (plus) | 3–5 people, task script | SUS, decision change, blind-spot accuracy (Likert), "did the check-in change your view?", time | all |
 
 - [ ] Build `evals/` (datasets + scripts + tests with fakes)
 - [ ] Run 1–7 live, hand-label 8–9, user study 10
@@ -204,7 +213,8 @@ Needs your machine (live Finnhub, Tavily, OpenRouter).
 4. Assumptions vs evidence + critic (15 s)
 5. Devil's advocate objections → dismiss one, rebut another (searched) → bot concedes or holds (30 s)
 6. Run a similar stock (a peer) → memory brings up the first thesis; dismissed category comes first (20 s)
-7. `/memory` (delete one) and `/blindspots` (10 s)
+7. `/checkin` on the first stock → what changed for each assumption since then (10 s)
+8. `/memory` (delete one) and `/blindspots` (5 s)
 
 Tip: run the ticker once before recording so news and sentiment are cached and the demo is fast.
 
@@ -216,4 +226,10 @@ Tip: run the ticker once before recording so news and sentiment are cached and t
 - **Paywalls:** teaser detection + top-up; fall back to Finnhub summary.
 - **Telegram limits:** messages split under 4096 chars, HTML escaped, long runs in background.
 - **Tavily irrelevant results:** only used for the user's claims, labelled by the sentiment agent (irrelevant ones are hidden), never fatal.
+- **Check-in finds nothing:** says "No new news" without an LLM call; old theses without stored queries search the reason.
 - **Regressions as the project grows:** run `.venv/bin/python -m pytest` before each change; add a test with each fix.
+
+## 9. Future work (out of scope for the PoC)
+
+- Web view of the full report (Telegram stays the main interface; the collapsible blocks cover most of the space problem)
+- Scheduled daily `/checkin` (needs `python-telegram-bot[job-queue]` and an opt-in per user)

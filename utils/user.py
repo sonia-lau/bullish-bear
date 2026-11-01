@@ -83,7 +83,8 @@ def save_thesis(user_id, session_id, stock, reason=None, intent=None, stock_risk
               "reason": reason,
               "intent": clean_choice(intent, INTENTS, "intent") if intent else None,
               "stockRisk": clean_choice(stock_risk, RISK_LEVELS, "stock_risk") if stock_risk else None,
-              "assumptions": [{k: a.get(k) for k in ("id", "text", "status", "note")} for a in assumptions or []],
+              "assumptions": [{k: a.get(k) for k in ("id", "text", "query", "status", "note")}
+                              for a in assumptions or []],
               "peers": list(peers or []), "remembered": bool(remembered),
               "decision": None, "createdAt": db.now()}
     thesis["_id"] = db.theses.insert_one(thesis).inserted_id
@@ -110,6 +111,16 @@ def past_theses(user_id, ticker=None, limit=5, peers=None, include_forgotten=Fal
     return list(db.theses.find(query).sort("createdAt", -1).limit(limit))
 
 
+def latest_theses(user_id, ticker=None, limit=3):
+    '''The most recent remembered thesis per stock, newest first (what a check-in revisits).'''
+    latest = {}
+    for t in past_theses(user_id, ticker, limit=50):
+        key = t.get("ticker") or t["stock"]
+        if ticker is None or key == ticker:   # past_theses also returns peers; a check-in is for this stock only
+            latest.setdefault(key, t)
+    return list(latest.values())[:limit]
+
+
 def delete_thesis(user_id, thesis_id):
     '''Forget one run: the thesis, its objections (so blind spots drop them), session and LLM logs.'''
     thesis = db.theses.find_one({"_id": to_object_id(thesis_id), "userId": user_id})
@@ -117,6 +128,7 @@ def delete_thesis(user_id, thesis_id):
         raise ValueError("Thesis not found")
     session_id = thesis["sessionId"]
     db.objections.delete_many({"sessionId": session_id, "userId": user_id})
+    db.checkins.delete_many({"thesisId": thesis["_id"], "userId": user_id})
     db.messages.delete_many({"sessionId": session_id})
     db.sessions.delete_one({"_id": session_id, "userId": user_id})
     db.theses.delete_one({"_id": thesis["_id"]})
@@ -213,6 +225,7 @@ def forget_user(user_id):
     counts = {
         "theses": db.theses.delete_many({"userId": user_id}).deleted_count,
         "objections": db.objections.delete_many({"userId": user_id}).deleted_count,
+        "checkins": db.checkins.delete_many({"userId": user_id}).deleted_count,
         "messages": db.messages.delete_many({"$or": [{"userId": user_id},
                                                      {"sessionId": {"$in": session_ids}}]}).deleted_count,
         "sessions": db.sessions.delete_many({"userId": user_id}).deleted_count,

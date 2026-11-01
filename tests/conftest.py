@@ -66,6 +66,9 @@ class FakeLLM:
         "devil": {"objections": [{"category": "valuation", "claim": "P/E of 30.0 is rich.", "sources": ["S1", "F3"]},
                                  {"category": "debt", "claim": "Debt is rising.", "sources": ["S2"]}]},
         "rebuttal": {"verdict": "hold", "reply": "Not convinced.", "sources": ["S1"]},
+        "checkin": {"assumptions": [{"id": "A1", "change": "Weakened", "note": "S1 says sales recovered.",
+                                     "sources": ["S1"]}],
+                    "summary": "Sales recovered; your bearish thesis looks weaker."},
     }
 
     def __init__(self):
