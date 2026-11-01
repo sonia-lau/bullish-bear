@@ -11,10 +11,18 @@ from CONSTANTS import FINNHUB_API_KEY
 
 finnhub_client = finnhub.Client(api_key=FINNHUB_API_KEY)
 
-def find_company(string): 
-    result = finnhub_client.symbol_lookup(string)
-    ticker = result["result"][0]["displaySymbol"]
-    return ticker
+def find_company(string):
+    result = finnhub_client.symbol_lookup(string).get("result", [])
+    if not result:
+        raise ValueError(f"No company found for '{string}'")
+    # Exact ticker match first, then US common stock (no ".XX" exchange suffix), then anything
+    for r in result:
+        if r["displaySymbol"].upper() == string.strip().upper():
+            return r["displaySymbol"]
+    for r in result:
+        if "." not in r["displaySymbol"] and r.get("type") == "Common Stock":
+            return r["displaySymbol"]
+    return result[0]["displaySymbol"]
 
 def get_company_news(ticker, start_date=None, end_date=None): 
     if start_date is None: 
@@ -80,7 +88,7 @@ def get_govt_spending(ticker, start_date=None, end_date=None):
         end_date = str(date.today())
     return finnhub_client.stock_usa_spending(symbol=ticker, _from=start_date, to=end_date)
 
-# print("---find_company---\n", find_company("SEAGATE"), "\n")
+# print("---find_company---\n", find_company("APPLE"), "\n")
 # print("---get_company_news---\n", get_company_news("STX"), "\n")
 # print("---get_company_basic_financials---\n", get_company_basic_financials("STX"), "\n")
 # print("---get_insider_sentiment---\n", get_insider_sentiment("STX"), "\n")
