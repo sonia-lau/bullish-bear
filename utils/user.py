@@ -1,11 +1,15 @@
 '''
 User pipeline: profile, responses to objections, and user-related memory.
 
-- Profile     : general risk appetite, muted categories
+- Profile     : general risk appetite, muted categories, whether memory is on
 - Theses      : why the user looked at each stock (reason, intent, risk for that stock) and their decision after
 - Responses   : accept / rebut / dismiss on each devil's-advocate objection, plus the back-and-forth on rebuttals
 - Blind spots : per-category dismiss counts, used to rank future objections
-- Memory      : a short text summary of all of the above that goes into the agents' prompts
+- Memory      : a short text summary of all of the above that goes into the agents' prompts,
+                including theses on similar stocks (Finnhub peers)
+
+With memory off, runs are still stored (so buttons work) but marked remembered: False, and
+nothing from them is used in later runs or blind spots. Users can delete single theses.
 '''
 
 from bson import ObjectId
@@ -17,6 +21,9 @@ RISK_LEVELS = ["low", "medium", "high"]
 INTENTS = ["curious", "signal"]
 RESPONSES = ["accept", "rebut", "dismiss"]
 DECISIONS = ["still_keen", "less_sure", "dropping"]
+
+# Old docs have no "remembered" field and count as remembered
+REMEMBERED = {"remembered": {"$ne": False}}
 
 
 def to_object_id(value):
@@ -38,7 +45,7 @@ def clean_choice(value, allowed, name):
 # ---------- Profile ----------
 
 def upsert_user(user_id, general_risk=None, name=None):
-    update = {"$setOnInsert": {"createdAt": db.now(), "mutedCategories": []},
+    update = {"$setOnInsert": {"createdAt": db.now(), "mutedCategories": [], "memoryOn": True},
               "$set": {"updatedAt": db.now()}}
     if general_risk is not None:
         update["$set"]["generalRisk"] = clean_choice(general_risk, RISK_LEVELS, "general_risk")
@@ -52,6 +59,17 @@ def get_user(user_id):
     return db.users.find_one({"userId": user_id})
 
 
+def set_memory(user_id, on):
+    '''Turn memory on or off. Off: later runs don't use or add to what we remember.'''
+    db.users.update_one({"userId": user_id},
+                        {"$set": {"memoryOn": bool(on), "updatedAt": db.now()},
+                         "$setOnInsert": {"createdAt": db.now(), "mutedCategories": []}}, upsert=True)
+
+
+def memory_on(user_id):
+    return (get_user(user_id) or {}).get("memoryOn", True)
+
+
 def mute_category(user_id, category, mute=True):
     op = "$addToSet" if mute else "$pull"
     db.users.update_one({"userId": user_id}, {op: {"mutedCategories": category.strip().lower()}})
@@ -59,11 +77,14 @@ def mute_category(user_id, category, mute=True):
 
 # ---------- Theses (why the user looked at a stock) ----------
 
-def save_thesis(user_id, session_id, stock, reason=None, intent=None, stock_risk=None, ticker=None):
+def save_thesis(user_id, session_id, stock, reason=None, intent=None, stock_risk=None, ticker=None,
+                assumptions=None, peers=None, remembered=True):
     thesis = {"userId": user_id, "sessionId": session_id, "stock": stock, "ticker": ticker,
               "reason": reason,
               "intent": clean_choice(intent, INTENTS, "intent") if intent else None,
               "stockRisk": clean_choice(stock_risk, RISK_LEVELS, "stock_risk") if stock_risk else None,
+              "assumptions": [{k: a.get(k) for k in ("id", "text", "status", "note")} for a in assumptions or []],
+              "peers": list(peers or []), "remembered": bool(remembered),
               "decision": None, "createdAt": db.now()}
     thesis["_id"] = db.theses.insert_one(thesis).inserted_id
     return thesis
@@ -78,11 +99,28 @@ def record_decision(user_id, session_id, decision):
         raise ValueError("No thesis for this session")
 
 
-def past_theses(user_id, ticker=None, limit=5):
+def past_theses(user_id, ticker=None, limit=5, peers=None, include_forgotten=False):
+    '''Most recent theses. With a ticker: theses on it and on similar stocks, i.e. a past ticker is
+    in this stock's peers, or this ticker is in that thesis's peers (so older rows still match).'''
     query = {"userId": user_id}
+    if not include_forgotten:
+        query |= REMEMBERED
     if ticker:
-        query["ticker"] = ticker
+        query["$or"] = [{"ticker": ticker}, {"ticker": {"$in": list(peers or [])}}, {"peers": ticker}]
     return list(db.theses.find(query).sort("createdAt", -1).limit(limit))
+
+
+def delete_thesis(user_id, thesis_id):
+    '''Forget one run: the thesis, its objections (so blind spots drop them), session and LLM logs.'''
+    thesis = db.theses.find_one({"_id": to_object_id(thesis_id), "userId": user_id})
+    if not thesis:
+        raise ValueError("Thesis not found")
+    session_id = thesis["sessionId"]
+    db.objections.delete_many({"sessionId": session_id, "userId": user_id})
+    db.messages.delete_many({"sessionId": session_id})
+    db.sessions.delete_one({"_id": session_id, "userId": user_id})
+    db.theses.delete_one({"_id": thesis["_id"]})
+    return thesis
 
 
 # ---------- Responses to objections ----------
@@ -119,7 +157,7 @@ def get_blind_spots(user_id, include_muted=False):
     user = get_user(user_id) or {}
     muted = set(user.get("mutedCategories", []))
     rows = db.objections.aggregate([
-        {"$match": {"userId": user_id, "response": {"$ne": None}}},
+        {"$match": {"userId": user_id, "response": {"$ne": None}, **REMEMBERED}},
         {"$group": {"_id": "$category",
                     "dismissed": {"$sum": {"$cond": [{"$eq": ["$response", "dismiss"]}, 1, 0]}},
                     "total": {"$sum": 1}}},
@@ -131,19 +169,30 @@ def get_blind_spots(user_id, include_muted=False):
 
 # ---------- Memory ----------
 
-def memory_context(user_id, ticker=None):
-    '''Short text for the agents' prompts: past reasons and decisions, and what the user tends to dismiss.'''
+STATUS_ICONS = {"supported": "supported", "contradicted": "contradicted", "mixed": "mixed evidence",
+                "no_evidence": "no evidence found"}
+
+
+def memory_context(user_id, ticker=None, peers=None):
+    '''Short text for the agents' prompts: past reasons, how their assumptions held up, decisions,
+    and what the user tends to dismiss. With a ticker, only that stock and similar ones.'''
     lines = []
-    for t in past_theses(user_id, ticker, limit=3):
+    for t in past_theses(user_id, ticker, limit=3, peers=peers):
         when = t["createdAt"].date().isoformat()
+        past = t.get("ticker") or t["stock"]
+        similar = " (a similar company)" if ticker and past != ticker else ""
         decided = f', decided: {t["decision"].replace("_", " ")}' if t.get("decision") else ""
-        lines.append(f'- {when} {t.get("ticker") or t["stock"]}: "{t.get("reason") or "no reason given"}"'
+        lines.append(f'- {when} {past}{similar}: "{t.get("reason") or "no reason given"}"'
                      f' (risk {t.get("stockRisk") or "?"}{decided})')
+        for a in t.get("assumptions") or []:
+            if a.get("status"):
+                lines.append(f'    assumed "{a["text"]}": {STATUS_ICONS.get(a["status"], a["status"])}')
     spots = [f"{c} ({v['dismissed']}/{v['total']} dismissed)"
              for c, v in get_blind_spots(user_id).items() if v["dismissed"]]
     text = ""
     if lines:
-        text += "User's past theses" + (f" on {ticker}" if ticker else "") + ":\n" + "\n".join(lines) + "\n"
+        about = f" on {ticker} and similar stocks" if ticker else ""
+        text += f"User's past theses{about}:\n" + "\n".join(lines) + "\n"
     if spots:
         text += "Kinds of points this user tends to dismiss: " + ", ".join(spots) + "\n"
     return text or "No past history for this user."
@@ -152,7 +201,9 @@ def memory_context(user_id, ticker=None):
 def get_memory(user_id):
     '''Everything stored about the user, for /memory.'''
     return {"user": get_user(user_id),
-            "theses": past_theses(user_id, limit=10),
+            # Memory-off runs are listed too, so they can be seen and deleted
+            "theses": past_theses(user_id, limit=10, include_forgotten=True),
+            "memoryOn": memory_on(user_id),
             "blindSpots": get_blind_spots(user_id, include_muted=True)}
 
 

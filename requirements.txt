@@ -1,0 +1,9 @@
+finnhub-python==2.4.29
+pymongo==4.19.0
+pytest==8.3.5
+python-dateutil==3.0.0
+python-dotenv==1.2.4
+python-telegram-bot==21.11.1
+requests==2.34.2
+tavily-python==0.8.5
+trafilatura==2.3.1

@@ -32,10 +32,9 @@ def get_company_news(ticker, start_date=None, end_date=None):
         end_date = str(date.today())
     return finnhub_client.company_news(ticker, _from=start_date, to=end_date)
 
-# def get_company_peers(ticker, grouping="subIndustry"): 
-#     if grouping not in ["sector", "industry", "subIndustry"]: 
-#         raise KeyError("Grouping not in ['sector', 'industry', 'subIndustry']")
-#     return finnhub_client.company_peers(ticker)
+def get_company_peers(ticker): 
+    # Finnhub groups peers by sub-industry; the list includes the ticker itself
+    return finnhub_client.company_peers(ticker)
 
 def get_company_basic_financials(ticker, metric="all"): 
     return finnhub_client.company_basic_financials(ticker, metric)

@@ -1,14 +1,18 @@
 '''
 Agents
-- get_news_sentiments : label each news article bullish / bearish / neutral / irrelevant
-- researcher_summary  : sourced summary of the news, citing [S#] ids
-- critic              : pokes holes in the user's reason and the researcher's summary
+- extract_assumptions : turn the user's reason into checkable claims, each with a search query
+- get_news_sentiments : Finnhub news + web search on the user's claims, each labelled
+                        bullish / bearish / neutral / irrelevant
+- researcher_summary  : sourced summary citing [S#] sources and [F#] financial facts
+- critic              : checks each of the user's assumptions, pokes holes in the summary
 - devils_advocate     : argues against buying, user's blind-spot categories first
-- rebuttal_reply      : devil's advocate answers when the user argues back
+- rebuttal_reply      : devil's advocate answers when the user argues back (searches their claim)
 - run_analysis        : runs all of the above for one user and saves to MongoDB
 '''
 
+import hashlib
 import json
+import logging
 import re
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -24,14 +28,22 @@ from pymongo import UpdateOne
 
 import CONSTANTS
 import db
+import financials
 import user
 from financial_news import find_company, get_company_news
+from web_search import search_news
 
 SENTIMENTS = ["bullish", "bearish", "neutral", "irrelevant"]
 CATEGORIES = ["valuation", "growth", "margins", "debt", "competition",
               "management", "macro", "sentiment", "other"]
 CACHE_HOURS = 6
 NEWS_DAYS = 10
+SEARCH_HOURS = 6
+SEARCH_RESULTS = 3   # per query
+MAX_ASSUMPTIONS = 3
+ASSUMPTION_STATUSES = ["supported", "contradicted", "mixed", "no_evidence"]
+
+log = logging.getLogger("bullish-bear.agent")
 
 
 # ---------- LLM ----------
@@ -99,7 +111,8 @@ def call_agent_json(prompt, system=None, retries=1, **log):
 # ---------- News (cached in MongoDB) ----------
 
 def resolve_dates(start, end):
-    end = end or str(date.today())
+    # Article dates are stored as UTC dates, so "today" must be the UTC day too
+    end = end or str(datetime.now(timezone.utc).date())
     start = start or str(date.fromisoformat(end) - timedelta(days=NEWS_DAYS))
     return start, end
 
@@ -128,7 +141,9 @@ def fetch_news_to_cache(ticker, start, end):
                       "date": datetime.fromtimestamp(a["datetime"], timezone.utc).date().isoformat(),
                       "finnhubId": a.get("id"),
                       "fetchedAt": db.now()},
-             "$setOnInsert": {"sentiment": None, "reason": None}},
+             "$setOnInsert": {"sentiment": None, "reason": None},
+             # Finnhub owns any url a web search found first, so it shows up in the news feed
+             "$unset": {"origin": ""}},
             upsert=True))
     if ops:
         db.news.bulk_write(ops, ordered=False)
@@ -137,28 +152,36 @@ def fetch_news_to_cache(ticker, start, end):
     return True
 
 
-def gather_top_n_news(stock, n=10, start=None, end=None, max_extra=None):
+def article_from_doc(doc, origin, query=None):
+    return {"_id": doc["_id"],
+            "headline": doc["headline"],
+            "summary": doc.get("summary") or "",
+            "source": doc.get("source") or "unknown",
+            "url": doc["url"],
+            "date": doc.get("date") or "undated",
+            "origin": origin,
+            "query": query,
+            "sentiment": doc.get("sentiment"),
+            "reason": doc.get("reason")}
+
+
+def gather_top_n_news(stock, n=10, start=None, end=None, max_extra=None, ticker=None):
     '''Newest articles until n of them have full text. Teasers and summary-only articles are
     kept for context but don't count towards n. At most n + max_extra articles in total.'''
-    ticker = find_company(stock)
+    ticker = ticker or find_company(stock)
     start, end = resolve_dates(start, end)
     fetch_news_to_cache(ticker, start, end)
     max_extra = n if max_extra is None else max_extra
 
     def candidates():
         seen = set()
-        for a in db.news.find({"ticker": ticker, "date": {"$gte": start, "$lte": end}}).sort("datetime", -1):
+        # Web-search results live in the same collection but aren't part of the news feed
+        query = {"ticker": ticker, "date": {"$gte": start, "$lte": end}, "origin": {"$ne": "search"}}
+        for a in db.news.find(query).sort("datetime", -1):
             if a["headline"] in seen:
                 continue
             seen.add(a["headline"])
-            yield {"_id": a["_id"],
-                   "headline": a["headline"],
-                   "summary": a["summary"],
-                   "source": a["source"],
-                   "url": a["url"],
-                   "date": a["date"],
-                   "sentiment": a.get("sentiment"),
-                   "reason": a.get("reason")}
+            yield article_from_doc(a, origin="news")
 
     pool, output, full = candidates(), [], 0
     while full < n and len(output) < n + max_extra:
@@ -172,6 +195,68 @@ def gather_top_n_news(stock, n=10, start=None, end=None, max_extra=None):
             output.append(a)
             full += a["textSource"] == "article"
     return ticker, output
+
+
+# ---------- Web search on the user's claims (cached in MongoDB) ----------
+
+def query_key(query):
+    '''Queries can hold the user's own words (a rebuttal), so the shared cache keeps only a hash.'''
+    return hashlib.sha256(" ".join(query.lower().split()).encode()).hexdigest()
+
+
+def search_to_cache(ticker, query):
+    '''Run a web news search unless the same query ran in the last SEARCH_HOURS. Returns result urls.'''
+    key = query_key(query)
+    last = db.searches.find_one({"ticker": ticker, "queryKey": key})
+    if last:
+        fetched = last["fetchedAt"]
+        if fetched.tzinfo is None:
+            fetched = fetched.replace(tzinfo=timezone.utc)
+        if db.now() - fetched < timedelta(hours=SEARCH_HOURS):
+            return last["urls"]
+
+    results = search_news(query, max_results=SEARCH_RESULTS)
+    ops = [UpdateOne({"ticker": ticker, "url": r["url"]},
+                     # Only new urls take Tavily's fields: a url Finnhub already gave us keeps
+                     # its Finnhub date and source, and stays a Finnhub article
+                     {"$setOnInsert": {"headline": r["title"], "summary": r["content"], "source": r["source"],
+                                       "date": r["date"], "datetime": r["datetime"], "fetchedAt": db.now(),
+                                       "origin": "search", "sentiment": None, "reason": None}},
+                     upsert=True)
+           for r in results]
+    if ops:
+        db.news.bulk_write(ops, ordered=False)
+    urls = [r["url"] for r in results]
+    db.searches.update_one({"ticker": ticker, "queryKey": key},
+                           {"$set": {"urls": urls, "fetchedAt": db.now()}}, upsert=True)
+    return urls
+
+
+def gather_search_results(ticker, queries, already=()):
+    '''Web results for each query, skipping anything already in `already`. A failed search is
+    skipped, not fatal: the run still has the Finnhub news.'''
+    seen_urls = {a["url"] for a in already}
+    seen_headlines = {a["headline"] for a in already}
+    output = []
+    for query in queries:
+        try:
+            urls = search_to_cache(ticker, query)
+        except Exception as e:
+            log.warning("Web search failed for %r: %s", query, e)
+            continue
+        docs = {d["url"]: d for d in db.news.find({"ticker": ticker, "url": {"$in": urls}})}
+        for url in urls:
+            doc = docs.get(url)
+            if not doc or url in seen_urls or doc["headline"] in seen_headlines:
+                continue
+            seen_urls.add(url)
+            seen_headlines.add(doc["headline"])
+            output.append(article_from_doc(doc, origin="search", query=query))
+    return add_article_text(output) if output else output
+
+
+def next_source_id(results):
+    return f'S{max([int(a["id"][1:]) for a in results if str(a.get("id", "")).startswith("S")] or [0]) + 1}'
 
 
 # ---------- Full article text (cached on the news doc) ----------
@@ -207,7 +292,7 @@ def fetch_article_text(url, max_chars=ARTICLE_CHARS):
 
 
 def add_article_text(articles):
-    '''Fill article["text"] with the full article (or paywall teaser), falling back to the Finnhub summary.
+    '''Fill article["text"] with the full article (or paywall teaser), falling back to the summary.
     Each url is downloaded once and cached for everyone.'''
     stored = {d["_id"]: d for d in db.news.find({"_id": {"$in": [a["_id"] for a in articles]}},
                                                  {"fullText": 1, "textSource": 1})}
@@ -266,9 +351,8 @@ Reply with JSON only: {{"sentiment": "bullish|bearish|neutral|irrelevant", "reas
 SENTIMENT_SYNONYMS = {"positive": "bullish", "negative": "bearish", "mixed": "neutral"}
 
 
-def get_news_sentiments(stock, n=10, start=None, end=None, session_id=None, user_id=None):
-    '''Returns (ticker, results, counts). Sentiments are cached on the news doc and reused by everyone.'''
-    ticker, articles = gather_top_n_news(stock, n, start, end)
+def label_sentiments(ticker, articles, session_id=None, user_id=None):
+    '''Label each article, cached on the news doc and reused by everyone. Returns (results, counts).'''
     results = []
     counts = {s: 0 for s in SENTIMENTS}
     for article in articles:
@@ -287,6 +371,17 @@ def get_news_sentiments(stock, n=10, start=None, end=None, session_id=None, user
             article["sentiment"], article["reason"] = sentiment or "neutral", reason
         counts[article["sentiment"]] += 1
         results.append({k: v for k, v in article.items() if k != "_id"})
+    return results, counts
+
+
+def get_news_sentiments(stock, n=10, start=None, end=None, queries=None, ticker=None,
+                        session_id=None, user_id=None):
+    '''Finnhub news plus web results for each query (the user's claims). Returns (ticker, results, counts).'''
+    ticker, articles = gather_top_n_news(stock, n, start, end, ticker=ticker)
+    for a in gather_search_results(ticker, (queries or [])[:MAX_ASSUMPTIONS], articles):
+        a["id"] = next_source_id(articles)
+        articles.append(a)
+    results, counts = label_sentiments(ticker, articles, session_id, user_id)
     return ticker, results, counts
 
 
@@ -298,9 +393,21 @@ def visible(results):
 
 
 def format_sources(results):
-    return "\n".join(f'{a["id"]}: {a["date"]} | {a["source"]} | {a["sentiment"]} | '
-                     f'{a["headline"]} — {a["text"][:800]}'
-                     for a in visible(results))
+    def found_by(a):
+        return f' | web search: "{a["query"]}"' if a.get("origin") == "search" and a.get("query") else ""
+    return "\n".join(f'{a["id"]}: {a.get("date") or "undated"} | {a["source"]} | {a["sentiment"]}{found_by(a)} | '
+                     f'{a["headline"]} — {(a.get("text") or a.get("summary") or "")[:800]}'
+                     for a in visible(results)) or "(no news sources)"
+
+
+def format_facts(facts):
+    return financials.format_facts(facts) if facts else "(no financial data)"
+
+
+def format_assumptions(assumptions, with_status=False):
+    def status(a):
+        return f' ({a["status"].replace("_", " ")})' if with_status and a.get("status") else ""
+    return "\n".join(f'{a["id"]}: {a["text"]}{status(a)}' for a in assumptions or []) or "(none given)"
 
 
 def as_list(value):
@@ -312,22 +419,33 @@ def as_list(value):
     return []
 
 
-def check_citations(items, results, key="sources"):
-    '''Code check: keep only source ids the agent was shown, and flag items left with none.'''
-    valid_ids = {a["id"] for a in visible(results)}
+CITATION = re.compile(r"([SF])\s*(\d+)", re.I)
+
+
+def item_text(item):
+    return " ".join(str(item.get(k) or "") for k in ("point", "claim", "issue", "reply", "note"))
+
+
+def check_citations(items, results, key="sources", facts=None):
+    '''Code check: keep only ids the agent was shown (S# sources, F# facts), and flag items left
+    with none. Numbers next to an F# citation are checked against the fact table:
+    numberCheck is "verified", "mismatch" or None (nothing to check).'''
+    valid_ids = {a["id"] for a in visible(results)} | {f["id"] for f in facts or []}
     checked = []
     for item in as_list(items):
         if isinstance(item, str):
             item = {"point": item, key: []}
         if not isinstance(item, dict):
             continue
-        # Accept "S1", "[S1]", "s1", "S1, S2" or a bare 1
+        # Accept "S1", "[S1]", "s1", "S1, F2" or a bare 1
         found = []
         for x in as_list(item.get(key)):
-            ids = [f"S{x}"] if isinstance(x, int) else [f"S{n}" for n in re.findall(r"S\s*(\d+)", str(x), re.I)]
-            found += [s for s in ids if s in valid_ids]
+            ids = [f"S{x}"] if isinstance(x, int) else [f"{k.upper()}{n}" for k, n in CITATION.findall(str(x))]
+            found += [i for i in ids if i in valid_ids]
         item[key] = list(dict.fromkeys(found))
         item["unverified"] = not item[key]
+        fact_ids = [i for i in item[key] if i.startswith("F")]
+        item["numberCheck"] = financials.check_numbers(item_text(item), fact_ids, facts) if fact_ids else None
         checked.append(item)
     return checked
 
@@ -346,71 +464,155 @@ def user_context(reason, stock_risk, general_risk, intent=None, memory=None):
     return text
 
 
+# ---------- Assumptions (what the user's reason depends on) ----------
+
+ASSUMPTION_SYSTEM = ("You help an investor make their reasoning checkable. Turn their reason for "
+                     "looking at a stock into the specific factual claims it depends on, each one "
+                     "something news or financial data could confirm or contradict. Keep the user's "
+                     "meaning; don't add claims they didn't make. Reply with JSON only.")
+
+
+def make_assumptions(ticker, items):
+    '''Normalise assumptions (from the LLM or typed by the user) to [{id, text, query}].'''
+    out = []
+    for item in as_list(items):
+        if isinstance(item, str):
+            item = {"text": item}
+        if not isinstance(item, dict):
+            continue
+        text = " ".join(str(item.get("text") or item.get("assumption") or "").split())
+        if not text:
+            continue
+        query = " ".join(str(item.get("query") or "").split()) or f"{ticker} {text}"
+        out.append({"id": f"A{len(out) + 1}", "text": text[:300], "query": query[:150]})
+        if len(out) == MAX_ASSUMPTIONS:
+            break
+    return out
+
+
+def extract_assumptions(ticker, reason, intent=None, user_id=None):
+    if not reason or not reason.strip():
+        return []
+    prompt = f'''Stock: {ticker}
+The user is {INTENT_TEXT.get(intent, "looking at this stock")}.
+User's reason: {reason}
+
+List 1-3 claims the reason depends on. For each, give a short web news search query (plain words,
+include the company name) that would find evidence for or against it.
+Reply with JSON only:
+{{"assumptions": [{{"text": "iPhone sales are falling", "query": "Apple iPhone sales decline"}}]}}'''
+    result = call_agent_json(prompt, ASSUMPTION_SYSTEM, user_id=user_id, role="assumptions")
+    return make_assumptions(ticker, result.get("assumptions"))
+
+
 # ---------- Researcher ----------
 
-RESEARCHER_SYSTEM = ("You are an equity researcher. Summarise only what the sources say. "
-                     "Every key point must cite source ids like S1. Never invent facts, numbers "
-                     "or sources. Do not give buy or sell advice. Reply with JSON only.")
+RESEARCHER_SYSTEM = ("You are an equity researcher. Summarise only what the sources and financial facts "
+                     "say. Every key point must cite ids: S1 for news sources, F1 for financial facts. "
+                     "When you use a number from a fact, copy it and cite its F id. Never invent facts, "
+                     "numbers or sources. Do not give buy or sell advice. Reply with JSON only.")
 
 
-def researcher_summary(ticker, results, counts, **log):
+def researcher_summary(ticker, results, counts, facts=None, **log):
     prompt = f'''Stock: {ticker}
 Sentiment counts: {json.dumps(counts)}
+
+Financial facts:
+{format_facts(facts)}
 
 Sources:
 {format_sources(results)}
 
-Write a short, balanced summary of the recent news for {ticker}.
+Write a short, balanced summary of the recent news and financials for {ticker}.
 Reply with JSON only:
 {{"summary": "3-5 sentences",
-  "key_points": [{{"point": "one sentence", "sources": ["S1"]}}],
+  "key_points": [{{"point": "one sentence", "sources": ["S1", "F2"]}}],
   "overall_sentiment": "bullish|bearish|neutral|mixed"}}'''
     result = call_agent_json(prompt, RESEARCHER_SYSTEM, **log)
-    result["key_points"] = check_citations(result.get("key_points"), results)
+    result["key_points"] = check_citations(result.get("key_points"), results, facts=facts)
     return result
 
 
 # ---------- Critic ----------
 
 CRITIC_SYSTEM = ("You are a strict reviewer. You did not write the summary and your job is to "
-                 "find problems in reasoning, not to argue a side. Check whether claims are "
-                 "supported by the cited sources, whether dates or periods are mixed up, and "
-                 "whether the user's reason is actually backed by the evidence. Reply with JSON only.")
+                 "find problems in reasoning, not to argue a side. Check each of the user's assumptions "
+                 "against the sources and financial facts, whether claims are supported by what they "
+                 "cite, and whether dates or periods are mixed up (e.g. a quarterly figure used as "
+                 "annual). If the sources don't cover a claim, mark it no_evidence: that does not make "
+                 "the user wrong, so never call a claim false only because the sources are silent. "
+                 "Reply with JSON only.")
+
+STATUS_SYNONYMS = {"support": "supported", "true": "supported", "confirmed": "supported",
+                   "contradict": "contradicted", "false": "contradicted", "refuted": "contradicted",
+                   "partial": "mixed", "partiallysupported": "mixed", "unclear": "no_evidence",
+                   "noevidence": "no_evidence", "unknown": "no_evidence", "notcovered": "no_evidence"}
 
 
-def critic(ticker, results, summary, reason, stock_risk, general_risk, intent=None, memory=None, **log):
+def check_assumptions(assumptions, reviewed, results, facts=None):
+    '''Merge the critic's verdicts onto the user's assumptions; any it skipped become no_evidence.'''
+    by_id = {}
+    for r in as_list(reviewed):
+        if isinstance(r, dict):
+            ids = re.findall(r"A\s*(\d+)", str(r.get("id") or ""), re.I)
+            if ids:
+                by_id.setdefault(f"A{ids[0]}", r)
+    merged = []
+    for a in assumptions or []:
+        r = by_id.get(a["id"], {})
+        status = re.sub(r"[^a-z]", "", str(r.get("status") or "").lower())
+        status = STATUS_SYNONYMS.get(status, status)
+        note = str(r.get("note") or "").strip() or ("" if r else "The critic didn't assess this.")
+        merged.append({**a, "status": status if status in ASSUMPTION_STATUSES else "no_evidence",
+                       "note": note, "sources": r.get("sources")})
+    return check_citations(merged, results, facts=facts)
+
+
+def critic(ticker, results, summary, reason, stock_risk, general_risk, intent=None, memory=None,
+           assumptions=None, facts=None, **log):
     prompt = f'''Stock: {ticker}
 {user_context(reason, stock_risk, general_risk, intent, memory)}
+
+User's assumptions to check:
+{format_assumptions(assumptions)}
 
 Researcher's summary:
 {json.dumps(summary, indent=2)}
 
+Financial facts:
+{format_facts(facts)}
+
 Sources:
 {format_sources(results)}
 
-List the problems you find. target is "user" if it's about the user's reason, "researcher" if it's about the summary.
+For each assumption give a status (supported, contradicted, mixed or no_evidence) and a one-sentence note.
+Then list other problems. target is "user" if it's about the user's reason, "researcher" if it's about the summary.
 Reply with JSON only:
-{{"issues": [{{"target": "user|researcher", "issue": "one sentence", "sources": ["S2"]}}],
+{{"assumptions": [{{"id": "A1", "status": "supported|contradicted|mixed|no_evidence", "note": "one sentence", "sources": ["S2", "F1"]}}],
+  "issues": [{{"target": "user|researcher", "issue": "one sentence", "sources": ["S2"]}}],
   "verdict": "one sentence on how well-supported the user's reason is"}}'''
     result = call_agent_json(prompt, CRITIC_SYSTEM, **log)
     issues = [i for i in as_list(result.get("issues")) if isinstance(i, dict) and i.get("issue")]
     for i in issues:
         target = str(i.get("target") or "").strip().lower()
         i["target"] = target if target in ("user", "researcher") else "researcher"
-    result["issues"] = check_citations(issues, results)
+    result["issues"] = check_citations(issues, results, facts=facts)
+    result["assumptions"] = check_assumptions(assumptions, result.get("assumptions"), results, facts)
     return result
 
 
 # ---------- Devil's advocate ----------
 
 DEVIL_SYSTEM = ("You are a devil's advocate. The user is leaning towards this stock; argue the "
-                "strongest case against it using only the sources given. Weigh each risk "
-                "against the user's risk appetite. Every objection must cite source ids. "
+                "strongest case against it using only the sources and financial facts given. Weigh "
+                "each risk against the user's risk appetite. Every objection must cite ids (S# sources, "
+                "F# facts) and copy numbers from facts exactly. Argue against the user's position, but "
+                "don't dismiss a claim of theirs just because the sources don't mention it. "
                 "Reply with JSON only.")
 
 
 def devils_advocate(ticker, results, summary, reason, stock_risk, general_risk, blind_spots,
-                    intent=None, memory=None, **log):
+                    intent=None, memory=None, assumptions=None, facts=None, **log):
     spots = [c for c, v in blind_spots.items() if v["dismissed"] > 0]
     spot_text = (f"The user has often dismissed these kinds of points before: {', '.join(spots)}. "
                  "Include an objection for these if the sources support one."
@@ -419,15 +621,21 @@ def devils_advocate(ticker, results, summary, reason, stock_risk, general_risk, 
 {user_context(reason, stock_risk, general_risk, intent, memory)}
 {spot_text}
 
+User's assumptions and how the evidence stands:
+{format_assumptions(assumptions, with_status=True)}
+
 Researcher's summary:
 {json.dumps(summary, indent=2)}
+
+Financial facts:
+{format_facts(facts)}
 
 Sources:
 {format_sources(results)}
 
 Give 3-5 objections against the user's reason. category must be one of: {", ".join(CATEGORIES)}.
 Reply with JSON only:
-{{"objections": [{{"category": "valuation", "claim": "one or two sentences", "sources": ["S3"]}}]}}'''
+{{"objections": [{{"category": "valuation", "claim": "one or two sentences", "sources": ["S3", "F1"]}}]}}'''
     result = call_agent_json(prompt, DEVIL_SYSTEM, **log)
     items = [o for o in as_list(result.get("objections")) if isinstance(o, dict) and o.get("claim")]
     for o in items:
@@ -435,7 +643,7 @@ Reply with JSON only:
         if category not in CATEGORIES:
             category = next((c for c in CATEGORIES if c != "other" and c in category), "other")
         o["category"] = category
-    items = check_citations(items, results)
+    items = check_citations(items, results, facts=facts)
 
     # Blind-spot ranking is done in code: most-dismissed categories first, with the reason shown
     for o in items:
@@ -450,21 +658,52 @@ Reply with JSON only:
 # ---------- Rebuttal (user argues back) ----------
 
 REBUTTAL_SYSTEM = ("You are the devil's advocate continuing a debate. The user has pushed back on one of "
-                   "your objections. Judge their rebuttal honestly: concede if it holds up against the "
-                   "sources, hold your ground if it doesn't, and say why in two or three sentences. "
-                   "Cite source ids. Reply with JSON only.")
+                   "your objections. Judge their rebuttal honestly against the sources and financial facts, "
+                   "including any new sources found by searching their claim: concede if it holds up, hold "
+                   "your ground if it doesn't, and say why in two or three sentences. If nothing covers "
+                   "their claim, say you couldn't confirm it rather than calling it wrong. Cite ids. "
+                   "Reply with JSON only.")
+
+
+def session_source(a):
+    '''What a session keeps of each source, so rebuttals can be argued against the same evidence.'''
+    return ({k: a.get(k) for k in ("id", "url", "headline", "source", "date", "sentiment",
+                                   "textSource", "origin", "query")}
+            | {"text": (a.get("text") or "")[:800]})
+
+
+def search_rebuttal(session, ticker, rebuttal, user_id=None):
+    '''Search the web for what the user just claimed, and add new results to the session's sources.'''
+    results = session.get("sources", [])
+    query = f'{ticker} {" ".join(rebuttal.split())}'[:150]
+    found = gather_search_results(ticker, [query], results)
+    if not found:
+        return results, []
+    for a in found:
+        a["id"] = next_source_id(results + found[:found.index(a)])
+    found, _ = label_sentiments(ticker, found, session.get("_id"), user_id)
+    db.sessions.update_one({"_id": session["_id"]},
+                           {"$push": {"sources": {"$each": [session_source(a) for a in found]}}})
+    return results + found, found
 
 
 def rebuttal_reply(user_id, objection_id, rebuttal):
-    '''The devil's advocate answers the user's rebuttal, using the sources from that session.'''
+    '''The devil's advocate answers the user's rebuttal, using the session's sources plus a web
+    search on the user's claim.'''
     objection = user.get_objection(user_id, objection_id)
     session = db.sessions.find_one({"_id": objection["sessionId"]}) or {}
-    results = session.get("sources", [])
+    results, new_sources = session.get("sources", []), []
+    if session:
+        results, new_sources = search_rebuttal(session, objection["ticker"], rebuttal, user_id)
+    facts = session.get("facts") or []
     history = "\n".join(f'User: {e["rebuttal"]}\nYou: {e["reply"]}' for e in objection.get("exchanges", []))
     prompt = f'''Stock: {objection["ticker"]}
 Your objection ({objection["category"]}): {objection["claim"]}
 {history}
 User's rebuttal: {rebuttal}
+
+Financial facts:
+{format_facts(facts)}
 
 Sources:
 {format_sources(results)}
@@ -476,7 +715,8 @@ Reply with JSON only:
     verdict = str(result.get("verdict") or "").strip().lower()
     result["verdict"] = verdict if verdict in ("concede", "hold") else "hold"
     result["reply"] = str(result.get("reply") or "").strip() or "I couldn't form a reply to that."
-    result = check_citations([result], results)[0]
+    result = check_citations([result], results, facts=facts)[0]
+    result["newSources"] = new_sources
     user.record_response(user_id, objection_id, "rebut", rebuttal)
     user.add_exchange(user_id, objection_id, rebuttal, result["reply"])
     return result
@@ -484,47 +724,70 @@ Reply with JSON only:
 
 # ---------- Full run ----------
 
+def lookup_stock(stock):
+    '''Ticker, fact table and peers for what the user typed. Raises ValueError if no company is found.
+    The bot calls this first to show a snapshot; run_analysis reuses the cached result.'''
+    ticker = find_company(stock)
+    return {"ticker": ticker, "facts": financials.get_facts(ticker), "peers": financials.get_peers(ticker)}
+
+
 def run_analysis(user_id, stock, reason=None, stock_risk=None, general_risk=None, intent=None,
-                 n=10, start=None, end=None):
+                 n=10, start=None, end=None, assumptions=None, ticker=None):
+    '''assumptions: confirmed by the user ([{text, query}] or strings). None means extract them here.'''
     profile = user.upsert_user(user_id, general_risk)
     general_risk = general_risk or profile.get("generalRisk")
+    remember = profile.get("memoryOn", True)
 
     session_id = db.sessions.insert_one({"userId": user_id, "stock": stock, "reason": reason,
                                          "intent": intent, "stockRisk": stock_risk,
-                                         "generalRisk": general_risk,
+                                         "generalRisk": general_risk, "remembered": remember,
                                          "status": "running", "createdAt": db.now()}).inserted_id
     log = {"session_id": session_id, "user_id": user_id}
 
     try:
-        ticker, results, counts = get_news_sentiments(stock, n, start, end, **log)
-        # Memory only holds past runs; this run's thesis is saved once the run succeeds
-        memory = user.memory_context(user_id, ticker)
-        summary = researcher_summary(ticker, results, counts, role="researcher", **log)
+        stock_info = lookup_stock(ticker or stock)
+        ticker, facts, peers = stock_info["ticker"], stock_info["facts"], stock_info["peers"]
+        if assumptions is None:
+            assumptions = extract_assumptions(ticker, reason, intent, user_id)
+        else:
+            assumptions = make_assumptions(ticker, assumptions)
+        ticker, results, counts = get_news_sentiments(stock, n, start, end,
+                                                      queries=[a["query"] for a in assumptions],
+                                                      ticker=ticker, **log)
+        # Memory only holds past runs; this run's thesis is saved once the run succeeds.
+        # With memory off, nothing about the user's past is used.
+        memory = user.memory_context(user_id, ticker, peers) if remember else None
+        blind_spots = user.get_blind_spots(user_id) if remember else {}
+        summary = researcher_summary(ticker, results, counts, facts, role="researcher", **log)
         critique = critic(ticker, results, summary, reason, stock_risk, general_risk,
-                          intent, memory, role="critic", **log)
-        blind_spots = user.get_blind_spots(user_id)
+                          intent, memory, assumptions, facts, role="critic", **log)
+        assumptions = critique["assumptions"]
         devil = devils_advocate(ticker, results, summary, reason, stock_risk, general_risk,
-                                blind_spots, intent, memory, role="devil", **log)
+                                blind_spots, intent, memory, assumptions, facts, role="devil", **log)
 
         # The user may have run /forget while this was running; keep nothing in that case
         if not db.sessions.find_one({"_id": session_id}, {"_id": 1}):
             raise ValueError("Your data was deleted while this analysis was running, so nothing was kept.")
+        # They may also have turned memory off mid-run: the stricter setting wins
+        remember = remember and user.memory_on(user_id)
 
-        user.save_thesis(user_id, session_id, stock, reason, intent, stock_risk, ticker)
+        user.save_thesis(user_id, session_id, stock, reason, intent, stock_risk, ticker,
+                         assumptions=assumptions, peers=peers, remembered=remember)
         for o in devil:
             o["_id"] = db.objections.insert_one({**o, "sessionId": session_id, "userId": user_id,
-                                                 "ticker": ticker, "response": None,
-                                                 "rebuttal": None, "createdAt": db.now()}).inserted_id
+                                                 "ticker": ticker, "response": None, "rebuttal": None,
+                                                 "remembered": remember,
+                                                 "createdAt": db.now()}).inserted_id
 
         done = db.sessions.update_one({"_id": session_id},
                                {"$set": {"ticker": ticker,
-                                         # Kept so rebuttals can be argued against the same sources
-                                         "sources": [{k: a[k] for k in ("id", "url", "headline", "source", "date",
-                                                                        "sentiment", "textSource")}
-                                                     | {"text": a["text"][:800]} for a in results],
+                                         # Kept so rebuttals can be argued against the same evidence
+                                         "sources": [session_source(a) for a in results],
+                                         "facts": facts, "assumptions": assumptions,
                                          "counts": counts, "summary": summary, "critique": critique,
                                          "textSources": dict(Counter(a["textSource"] for a in results)),
                                          "objectionIds": [o["_id"] for o in devil],
+                                         "remembered": remember,
                                          "status": "done", "finishedAt": db.now()}})
         if done.matched_count == 0:
             raise ValueError("Your data was deleted while this analysis was running, so nothing was kept.")
@@ -541,8 +804,9 @@ def run_analysis(user_id, stock, reason=None, stock_risk=None, general_risk=None
         raise
 
     return {"sessionId": session_id, "ticker": ticker, "sources": results, "counts": counts,
+            "facts": facts, "assumptions": assumptions, "peers": peers,
             "summary": summary, "critique": critique, "objections": devil,
-            "blindSpots": blind_spots, "memory": memory}
+            "blindSpots": blind_spots, "memory": memory, "remembered": remember}
 
 
 if __name__ == "__main__":
